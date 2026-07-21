@@ -1,0 +1,41 @@
+name: Autofill Runner
+
+on:
+  push:
+    branches: [main] # first tick fires immediately on repo creation — no manual "Run workflow" click
+  schedule:
+    # Every 5 minutes (GitHub's minimum). Public repos = unlimited free minutes.
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {} # manual trigger from the Actions tab
+
+concurrency:
+  group: autofill-runner
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install runner deps
+        working-directory: automation
+        run: bun install --frozen-lockfile || bun install
+
+      - name: Install Playwright browsers
+        working-directory: automation
+        run: bunx playwright install --with-deps chromium
+
+      - name: Poll for queued sessions (max 4 min, then exit for next cron tick)
+        working-directory: automation
+        env:
+          APP_BASE_URL: ${{ secrets.APP_BASE_URL }}
+          RUNNER_SHARED_SECRET: ${{ secrets.RUNNER_SHARED_SECRET }}
+        run: |
+          # Exit 0 on timeout so the workflow doesn't red-X every tick.
+          timeout --preserve-status 240 bun run autofill-runner.ts || true
