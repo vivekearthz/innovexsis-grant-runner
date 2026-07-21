@@ -1,0 +1,17 @@
+[Unit]
+Description=GovSchemeOS Playwright Autofill Runner
+After=network.target
+
+[Service]
+Type=simple
+User=govrunner
+WorkingDirectory=/opt/govschemeos/automation
+EnvironmentFile=/opt/govschemeos/automation/.env
+ExecStart=/usr/bin/env bun run autofill-runner.ts
+Restart=on-failure
+RestartSec=10
+# Headed browser needs a display; ensure Xvfb or a real display is available.
+Environment=DISPLAY=:0
+
+[Install]
+WantedBy=multi-user.target
