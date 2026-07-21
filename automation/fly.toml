@@ -1,0 +1,32 @@
+# Fly.io config for GovSchemeOS autofill runner.
+# Deploy from the `automation/` directory:
+#   cd automation
+#   fly launch --no-deploy --copy-config --name govschemeos-runner
+#   fly secrets set APP_BASE_URL=https://grant-wizardry-26.lovable.app \
+#                   RUNNER_SHARED_SECRET=<paste-from-lovable-cloud-secrets> \
+#                   RUNNER_ID=fly-iad-1
+#   fly deploy
+#
+# The runner is a background poller — no HTTP service, no public port.
+# One always-on machine is enough; Fly's free tier includes 3 shared-cpu-1x
+# machines with 256MB RAM (bump to 512MB if Chromium OOMs).
+
+app = "govschemeos-runner"
+primary_region = "iad"  # change to your nearest region: sin, bom, fra, lhr, etc.
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  RUNNER_HEADLESS = "1"
+
+# No [http_service] block — this is a worker, not a web app.
+# Fly keeps the machine running because there's a CMD process.
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"  # Chromium needs ~300MB; 256MB is tight
+  cpus = 1
+
+[deploy]
+  strategy = "immediate"
