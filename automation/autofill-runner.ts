@@ -326,7 +326,9 @@ async function processFreelancerGig(job: FreelancerGigClaimResp) {
   try {
     const context = await browser.newContext({ acceptDownloads: true });
     const page = await context.newPage();
-    await page.goto(job.target_url, { waitUntil: "networkidle", timeout: 60000 });
+    await page.goto(job.target_url, { waitUntil: "domcontentloaded", timeout: 45000 });
+    await page.waitForLoadState("load", { timeout: 15000 }).catch(() => {});
+
 
     if (await loginRequired(page)) {
       const shot = await page.screenshot({ fullPage: true });
@@ -419,7 +421,9 @@ async function processJob(job: ClaimResp) {
         return;
       }
       await update(job.session_id, { current_step: "analysing" });
-      await page.goto(portalUrl, { waitUntil: "networkidle" });
+      await page.goto(portalUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
+      await page.waitForLoadState("load", { timeout: 15000 }).catch(() => {});
+
       const fields = await extractFormFields(page);
       const submitSel = await findSubmitCandidate(page);
       const map = await postJson<{ field_map: FieldEntry[]; file_uploads: FileEntry[] }>(
@@ -437,7 +441,11 @@ async function processJob(job: ClaimResp) {
 
     // 2. Fill fields
     await update(job.session_id, { current_step: "filling" });
-    if (job.mode === "recorder") await page.goto(portalUrl!, { waitUntil: "networkidle" });
+    if (job.mode === "recorder") {
+      await page.goto(portalUrl!, { waitUntil: "domcontentloaded", timeout: 45000 });
+      await page.waitForLoadState("load", { timeout: 15000 }).catch(() => {});
+    }
+
 
     const filled: Record<string, string> = {};
     for (const entry of fieldMap ?? []) {
@@ -554,18 +562,54 @@ async function waitForOtp(sessionId: string, timeoutMs: number): Promise<string 
   return null;
 }
 
+// Hard per-job timeout guard. If processJob hangs (portal never idles,
+// captcha wall, network blackhole), mark the session as needing human
+// action WITH a screenshot instead of leaving it stuck in "filling"
+// forever. Runs inside processJob's own try/catch so a timeout still
+// closes the browser cleanly.
+async function withTimeout<T>(promise: Promise<T>, ms: number, onTimeout: () => Promise<void>): Promise<T | null> {
+  return await Promise.race([
+    promise.then((v) => v as T | null),
+    new Promise<T | null>((resolve) => setTimeout(async () => { await onTimeout().catch(() => {}); resolve(null); }, ms)),
+  ]);
+}
+
+// ONE JOB PER RUN, then exit. Prevents workflow-timeout from killing a
+// job mid-fill and matches the user's "one at a time" processing directive.
+// The GitHub Actions cron re-invokes every 5 min, so throughput is unchanged.
+const PER_JOB_TIMEOUT_MS = 3 * 60 * 1000; // 3 min, leaves 60s slack under 4 min workflow cap
+
 async function main() {
   console.log(`GovSchemeOS runner ${RUNNER_ID} started (headless=${HEADLESS}), polling ${APP}`);
-  while (true) {
-    try {
-      const job = await claim();
-      if (job?.type === "freelancer_gig") await processFreelancerGig(job);
-      else if (job) await processJob(job);
-    } catch (e) {
-      console.error("poll error", e);
+  try {
+    const job = await claim();
+    if (!job) { console.log("no job"); return; }
+    if (job.type === "freelancer_gig") {
+      await withTimeout(
+        processFreelancerGig(job),
+        PER_JOB_TIMEOUT_MS,
+        async () => { await updateGig(job.id, { status: "awaiting_login", error_log: "runner timeout — handoff" }); },
+      );
+    } else {
+      await withTimeout(
+        processJob(job),
+        PER_JOB_TIMEOUT_MS,
+        async () => {
+          console.error(`[${job.session_id}] TIMEOUT after ${PER_JOB_TIMEOUT_MS}ms — handing off`);
+          await update(job.session_id, {
+            status: "awaiting_human_action",
+            current_step: "runner_timeout",
+            awaiting_human_since: new Date().toISOString(),
+            error_log: `Runner hard-timeout at ${PER_JOB_TIMEOUT_MS}ms (portal never became interactive)`,
+            next_action: "Portal did not respond in time. Open the resume URL and complete manually.",
+          });
+        },
+      );
     }
-    await new Promise(r => setTimeout(r, 10000));
+  } catch (e) {
+    console.error("main error", e);
   }
 }
 
 main();
+
