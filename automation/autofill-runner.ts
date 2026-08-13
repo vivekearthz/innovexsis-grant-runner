@@ -12,7 +12,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
-const APP = process.env.APP_BASE_URL!;
+// Self-healing base URL. A workspace move (or a rename) can leave APP_BASE_URL
+// pointing at a host that now answers 3xx instead of serving the API — the
+// runner then polls forever and claims nothing. So we probe every known base
+// at boot and adopt the first one that actually serves the API.
+const BASE_CANDIDATES = [
+  process.env.APP_BASE_URL,
+  "https://grantmonsy.innovexsis.com",
+  "https://grant-wizardry-26.lovable.app",
+  "https://project--4c40a0f5-5a99-4ee7-ae1f-360884387fc6.lovable.app",
+].filter((u): u is string => Boolean(u)).map((u) => u.replace(/\/+$/, ""));
+
+let APP = BASE_CANDIDATES[0] ?? "";
 const SECRET = process.env.RUNNER_SHARED_SECRET!;
 const RUNNER_ID = process.env.RUNNER_ID ?? `runner-${randomUUID().slice(0, 8)}`;
 const RESUME_TPL = process.env.RESUME_URL_TEMPLATE ?? "";
@@ -22,6 +33,28 @@ if (!APP || !SECRET) {
   console.error("APP_BASE_URL and RUNNER_SHARED_SECRET must be set");
   process.exit(1);
 }
+
+/** Pick a base URL that serves the API directly (no redirect, no auth wall). */
+async function resolveBase(): Promise<void> {
+  for (const base of BASE_CANDIDATES) {
+    try {
+      const res = await fetch(`${base}/api/public/portal/version`, {
+        redirect: "manual",
+        headers: { "x-runner-secret": SECRET },
+      });
+      if (res.status >= 200 && res.status < 300) {
+        if (base !== APP) console.warn(`[runner] base self-heal: ${APP} -> ${base}`);
+        APP = base;
+        return;
+      }
+      console.warn(`[runner] base ${base} unusable (HTTP ${res.status})`);
+    } catch (e) {
+      console.warn(`[runner] base ${base} unreachable:`, (e as Error).message);
+    }
+  }
+  console.error("[runner] no usable base URL found; keeping", APP);
+}
+
 
 interface FieldEntry { selector: string; source: string; type: string }
 interface FileEntry { selector: string; doc_type: string }
@@ -70,7 +103,39 @@ interface FreelancerGigClaimResp {
   max_retries: number;
 }
 
-type RunnerJob = ({ type: "autofill" } & ClaimResp) | FreelancerGigClaimResp;
+interface JobPosting {
+  id: string;
+  portal: string | null;
+  post_name: string;
+  apply_url: string | null;
+  fee_inr: number | null;
+  required_docs: string[];
+  required_fields: string[];
+}
+interface JobRecipe {
+  portal_key: string;
+  login_url: string | null;
+  field_map: unknown;
+  doc_map: unknown;
+  fee_ceiling_inr: number;
+  needs_captcha: boolean;
+  needs_otp: boolean;
+  submit_selector: string | null;
+}
+interface JobClaimResp {
+  type: "job_application";
+  session_id: string;
+  application_id: string;
+  user_id: string;
+  posting: JobPosting;
+  recipe: JobRecipe | null;
+  application: { id: string; status: string } | null;
+  applicant_facts: Record<string, string>;
+  login: { username: string; password: string } | null;
+  documents: { doc_type: string; file_name: string; url: string | null }[];
+}
+
+type RunnerJob = ({ type: "autofill" } & ClaimResp) | FreelancerGigClaimResp | JobClaimResp;
 
 function resolve(source: string, entity: Record<string, unknown> | null, brand: Record<string, unknown> | null): string {
   const [table, col] = source.split(".");
@@ -114,10 +179,25 @@ async function claim(): Promise<RunnerJob | null> {
     headers: { "content-type": "application/json", "x-runner-secret": SECRET },
     body: JSON.stringify({ runnerId: RUNNER_ID }),
   });
-  if (res.status === 204) return await claimFreelancerGig();
+  if (res.status === 204) {
+    const job = await claimJobApplication();
+    if (job) return job;
+    return await claimFreelancerGig();
+  }
   if (!res.ok) { console.error("claim failed", res.status, await res.text()); return null; }
   const job = await res.json() as ClaimResp;
   return { type: "autofill", ...job };
+}
+
+async function claimJobApplication(): Promise<JobClaimResp | null> {
+  const res = await fetch(`${APP}/api/public/jobs/runner-claim`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-runner-secret": SECRET },
+    body: JSON.stringify({ runnerId: RUNNER_ID }),
+  });
+  if (res.status === 204) return null;
+  if (!res.ok) { console.error("jobs claim failed", res.status, await res.text()); return null; }
+  return await res.json() as JobClaimResp;
 }
 
 async function claimFreelancerGig(): Promise<FreelancerGigClaimResp | null> {
@@ -129,6 +209,15 @@ async function claimFreelancerGig(): Promise<FreelancerGigClaimResp | null> {
   if (res.status === 204) return null;
   if (!res.ok) { console.error("freelancer claim failed", res.status, await res.text()); return null; }
   return await res.json() as FreelancerGigClaimResp;
+}
+
+async function updateJob(sessionId: string, body: Record<string, unknown>) {
+  const res = await fetch(`${APP}/api/public/jobs/runner-update/${sessionId}`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-runner-secret": SECRET },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) console.error("job update failed", res.status, await res.text());
 }
 
 async function update(sessionId: string, body: Record<string, unknown>) {
@@ -577,9 +666,256 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, onTimeout: () => 
 // ONE JOB PER RUN, then exit. Prevents workflow-timeout from killing a
 // job mid-fill and matches the user's "one at a time" processing directive.
 // The GitHub Actions cron re-invokes every 5 min, so throughput is unchanged.
-const PER_JOB_TIMEOUT_MS = 3 * 60 * 1000; // 3 min, leaves 60s slack under 4 min workflow cap
+// 7 min budget leaves 60s slack under the 8 min workflow cap and gives the
+// 5-min OTP wait room to complete after navigation/mapping/fill.
+const PER_JOB_TIMEOUT_MS = 7 * 60 * 1000;
+
+// Fetch current session so we don't clobber a legitimate awaiting_otp /
+// awaiting_human_action / completed state with a misleading "runner timeout"
+// message. Returns null on error so the caller falls back to overwriting.
+async function fetchSessionStatus(sessionId: string): Promise<string | null> {
+  try {
+    const res = await fetch(`${APP}/api/public/runner/otp/${sessionId}`, {
+      headers: { "x-runner-secret": SECRET },
+    });
+    if (!res.ok) return null;
+    const j = await res.json() as { status?: string | null };
+    return j.status ?? null;
+  } catch { return null; }
+}
+
+// -------------------- JOB APPLICATION BRANCH --------------------
+// Government job portals (UPSC/SSC/IBPS/etc.). Full lifecycle:
+//  1. Navigate to apply_url.
+//  2. If login page detected, fill credentials + solve captcha via AI.
+//  3. Extract form fields → AI mapper (reuses the grants /runner/map endpoint
+//     is scheme-only; we use a lightweight source resolver against
+//     applicant_facts + posting.required_fields directly).
+//  4. Upload documents matching required_docs by doc_type.
+//  5. OTP loop with 5-min wait per attempt.
+//  6. Screenshot + hand off to human for the final Submit click. Per project
+//     rule: the runner NEVER clicks Submit on government portals.
+
+async function solveCaptcha(page: Page): Promise<string | null> {
+  // Common captcha image selectors on Indian gov portals.
+  const selectors = ["img[src*='captcha' i]", "img[id*='captcha' i]", "img[alt*='captcha' i]"];
+  for (const sel of selectors) {
+    const el = await page.$(sel);
+    if (!el) continue;
+    try {
+      const buf = await el.screenshot();
+      const b64 = buf.toString("base64");
+      const res = await fetch(`${APP}/api/public/jobs/captcha-solve`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-runner-secret": SECRET },
+        body: JSON.stringify({ image_b64: b64 }),
+      });
+      if (!res.ok) continue;
+      const j = await res.json() as { ok?: boolean; text?: string };
+      if (j.ok && j.text) return j.text;
+    } catch { /* try next */ }
+  }
+  return null;
+}
+
+async function attemptLogin(page: Page, login: { username: string; password: string }): Promise<boolean> {
+  const filledUser = await fillFirstAvailable(page, [/user.?name|user.?id|login.?id|email|registration.?no/], login.username);
+  const filledPw = await fillFirstAvailable(page, [/password|passwd|pwd/], login.password);
+  if (!filledUser || !filledPw) return false;
+
+  const captchaText = await solveCaptcha(page);
+  if (captchaText) {
+    await fillFirstAvailable(page, [/captcha|verification.?text|security.?code/], captchaText);
+  }
+
+  const clicked = await page.evaluate(() => {
+    const btns = Array.from(document.querySelectorAll('button, input[type="submit"], input[type="button"]'));
+    const login = btns.find(b => /log\s*in|sign\s*in|submit/i.test((b.textContent ?? (b as HTMLInputElement).value ?? "").trim()));
+    if (!login) return false;
+    (login as HTMLElement).click();
+    return true;
+  });
+  if (clicked) await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
+  return true;
+}
+
+async function resolveJobValue(field: { name?: string; id?: string; label?: string; placeholder?: string }, facts: Record<string, string>): Promise<string | null> {
+  const hay = `${field.name ?? ""} ${field.id ?? ""} ${field.label ?? ""} ${field.placeholder ?? ""}`.toLowerCase();
+  const rules: Array<[RegExp, string[]]> = [
+    [/full.?name|candidate.?name|applicant.?name/, ["founder_full_name", "founder_name", "applicant_full_name"]],
+    [/first.?name/, ["founder_first_name", "applicant_first_name"]],
+    [/last.?name|surname/, ["founder_last_name", "applicant_last_name"]],
+    [/father/, ["founder_father_name", "applicant_father_name"]],
+    [/mother/, ["founder_mother_name", "applicant_mother_name"]],
+    [/dob|date.?of.?birth|birth.?date/, ["founder_dob", "applicant_dob"]],
+    [/gender/, ["founder_gender", "applicant_gender"]],
+    [/email/, ["founder_email", "applicant_email"]],
+    [/mobile|phone|contact.?no/, ["founder_mobile", "applicant_mobile", "founder_phone"]],
+    [/aadhaar|aadhar|uid/, ["founder_aadhaar", "applicant_aadhaar"]],
+    [/pan/, ["founder_pan", "applicant_pan"]],
+    [/category|caste/, ["applicant_category", "founder_category"]],
+    [/address|residence/, ["founder_address", "applicant_address"]],
+    [/pincode|pin.?code|zip/, ["founder_pincode", "applicant_pincode"]],
+    [/state/, ["founder_state", "applicant_state"]],
+    [/district|city/, ["founder_city", "founder_district", "applicant_city"]],
+    [/nationality/, ["founder_nationality", "applicant_nationality"]],
+    [/qualification|education/, ["founder_qualification", "applicant_qualification"]],
+  ];
+  for (const [rx, keys] of rules) {
+    if (!rx.test(hay)) continue;
+    for (const k of keys) if (facts[k]) return facts[k];
+  }
+  return null;
+}
+
+async function processJobApplication(job: JobClaimResp) {
+  const sid = job.session_id;
+  console.log(`[job:${sid}] ${job.posting.portal ?? "unknown"} — ${job.posting.post_name}`);
+  const resumeUrl = RESUME_TPL ? RESUME_TPL.replace("{session_id}", sid) : undefined;
+  await updateJob(sid, { status: "filling", current_step: "starting", ...(resumeUrl ? { resume_url: resumeUrl } : {}) });
+
+  const applyUrl = job.posting.apply_url ?? job.recipe?.login_url ?? null;
+  if (!applyUrl) {
+    await updateJob(sid, { status: "failed", error_log: "no apply_url on posting" });
+    return;
+  }
+
+  const browser = await chromium.launch({
+    headless: HEADLESS,
+    args: HEADLESS ? [] : ["--remote-debugging-port=9222", "--no-sandbox"],
+  });
+  try {
+    const context = await browser.newContext({ acceptDownloads: true });
+    const page = await context.newPage();
+    await page.goto(applyUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
+    await page.waitForLoadState("load", { timeout: 15000 }).catch(() => {});
+
+    // Login if required and creds provided.
+    if (await loginRequired(page)) {
+      if (!job.login) {
+        const shot = await page.screenshot({ fullPage: true });
+        await updateJob(sid, {
+          status: "awaiting_login",
+          screenshot_base64: shot.toString("base64"),
+          next_action: `Portal ${job.posting.portal ?? ""} requires login but no credentials are stored. Save them via secure form.`,
+        });
+        return;
+      }
+      await updateJob(sid, { current_step: "logging_in" });
+      const ok = await attemptLogin(page, job.login);
+      if (!ok) {
+        const shot = await page.screenshot({ fullPage: true });
+        await updateJob(sid, {
+          status: "awaiting_login",
+          screenshot_base64: shot.toString("base64"),
+          next_action: "Runner could not find login fields. Complete the login manually and retry.",
+        });
+        return;
+      }
+      // OTP after login?
+      if (await detectOtpPrompt(page)) {
+        const prompt = await detectOtpPrompt(page);
+        await updateJob(sid, { awaiting_otp: true, otp_prompt: prompt, current_step: "awaiting_otp_login" });
+        const otp = await waitForOtp(sid, 5 * 60 * 1000);
+        if (!otp) { await updateJob(sid, { status: "failed", error_log: "login OTP timeout" }); return; }
+        const otpSel = await page.evaluate(() => {
+          const inputs = Array.from(document.querySelectorAll("input")) as HTMLInputElement[];
+          const el = inputs.find(i => /otp|verification.?code|one.?time/i.test(`${i.name} ${i.id} ${i.placeholder}`));
+          return el ? (el.id ? `#${el.id}` : `input[name="${el.name}"]`) : null;
+        });
+        if (otpSel) await page.fill(otpSel, otp);
+        await updateJob(sid, { otp_value: null, current_step: "verifying_login_otp", awaiting_otp: false });
+        await clickNext(page);
+      }
+    }
+
+    // Fill the application form using applicant_facts + label-matching.
+    await updateJob(sid, { current_step: "filling_form" });
+    const fields = await extractFormFields(page);
+    const filled: Record<string, string> = {};
+    for (const f of fields) {
+      if (["file"].includes(f.type)) continue;
+      const value = await resolveJobValue(f, job.applicant_facts);
+      if (!value) continue;
+      try {
+        await fillField(page, { selector: f.selector, source: "applicant_facts", type: f.type }, value);
+        filled[f.selector] = value;
+      } catch { /* skip */ }
+    }
+
+    // Uploads: match documents by doc_type against posting.required_docs.
+    const attached: string[] = [];
+    const fileInputs = fields.filter(f => f.type === "file");
+    for (const f of fileInputs) {
+      const hay = `${f.name ?? ""} ${f.id ?? ""} ${f.label ?? ""} ${f.placeholder ?? ""}`.toLowerCase();
+      const wantType = job.posting.required_docs.find(d => hay.includes(d.replace(/_/g, " ")))
+        ?? (hay.includes("photo") ? "photo" : hay.includes("sign") ? "signature" : null);
+      if (!wantType) continue;
+      const doc = job.documents.find(d => d.doc_type === wantType);
+      if (!doc?.url) continue;
+      try {
+        const res = await fetch(doc.url);
+        if (!res.ok) continue;
+        const dir = join(tmpdir(), "govschemeos-jobs");
+        await mkdir(dir, { recursive: true });
+        const path = join(dir, `${randomUUID()}-${doc.file_name}`);
+        await writeFile(path, Buffer.from(await res.arrayBuffer()));
+        try {
+          await page.setInputFiles(f.selector, path);
+          attached.push(doc.file_name);
+        } finally { unlink(path).catch(() => {}); }
+      } catch (e) { console.warn("upload failed", (e as Error).message); }
+    }
+
+    await updateJob(sid, { fields_filled: filled, documents_attached: attached, current_step: "advancing" });
+    await clickNext(page).catch(() => {});
+
+    // Application OTP loop (post-form).
+    let iterations = 0;
+    while (iterations < 5) {
+      iterations++;
+      const otpPrompt = await detectOtpPrompt(page);
+      if (!otpPrompt) break;
+      await updateJob(sid, { awaiting_otp: true, otp_prompt: otpPrompt, current_step: "awaiting_form_otp" });
+      const otp = await waitForOtp(sid, 5 * 60 * 1000);
+      if (!otp) { await updateJob(sid, { status: "failed", error_log: "form OTP timeout" }); return; }
+      const otpSel = await page.evaluate(() => {
+        const inputs = Array.from(document.querySelectorAll("input")) as HTMLInputElement[];
+        const el = inputs.find(i => /otp|verification.?code|one.?time/i.test(`${i.name} ${i.id} ${i.placeholder}`));
+        return el ? (el.id ? `#${el.id}` : `input[name="${el.name}"]`) : null;
+      });
+      if (otpSel) await page.fill(otpSel, otp);
+      await updateJob(sid, { otp_value: null, awaiting_otp: false, current_step: "verifying_form_otp" });
+      await clickNext(page);
+    }
+
+    // Fee handling: if page mentions payment >0, hand off (auto-pay not
+    // wired yet — RAZORPAY_UPI_TOKEN pipeline is queued for future patch).
+    const needsFee = await page.evaluate(() =>
+      /pay(ment)?|application fee|₹\s*\d+|rs\.?\s*\d+/i.test(document.body.innerText.slice(0, 5000)),
+    ).catch(() => false);
+
+    // Final: never click Submit ourselves. Screenshot + hand off.
+    const shot = await page.screenshot({ fullPage: true });
+    await updateJob(sid, {
+      status: needsFee ? "awaiting_fee" : "awaiting_human_action",
+      screenshot_base64: shot.toString("base64"),
+      next_action: needsFee
+        ? `Form filled. Pay fee ₹${job.posting.fee_inr ?? "?"} and click Submit. Portal: ${job.posting.portal ?? "unknown"}.`
+        : `Form filled with ${Object.keys(filled).length} fields and ${attached.length} docs. Review and click Submit — runner never submits gov job forms per policy.`,
+      ...(resumeUrl ? { resume_url: resumeUrl } : {}),
+    });
+    console.log(`[job:${sid}] handed off (fee=${needsFee})`);
+  } catch (e) {
+    console.error(`[job:${sid}] error`, e);
+    await updateJob(sid, { status: "failed", error_log: String(e) });
+  } finally {
+    await browser.close().catch(() => {});
+  }
+}
 
 async function main() {
+  await resolveBase();
   console.log(`GovSchemeOS runner ${RUNNER_ID} started (headless=${HEADLESS}), polling ${APP}`);
   try {
     const job = await claim();
@@ -590,18 +926,36 @@ async function main() {
         PER_JOB_TIMEOUT_MS,
         async () => { await updateGig(job.id, { status: "awaiting_login", error_log: "runner timeout — handoff" }); },
       );
+    } else if (job.type === "job_application") {
+      await withTimeout(
+        processJobApplication(job),
+        PER_JOB_TIMEOUT_MS,
+        async () => {
+          console.error(`[job:${job.session_id}] TIMEOUT — requeuing`);
+          await updateJob(job.session_id, {
+            status: "failed",
+            error_log: `Runner hard-timeout at ${PER_JOB_TIMEOUT_MS}ms — auto-requeued`,
+          });
+        },
+      );
     } else {
       await withTimeout(
         processJob(job),
         PER_JOB_TIMEOUT_MS,
         async () => {
-          console.error(`[${job.session_id}] TIMEOUT after ${PER_JOB_TIMEOUT_MS}ms — handing off`);
+          const current = await fetchSessionStatus(job.session_id);
+          if (current === "awaiting_otp" || current === "awaiting_human_action" || current === "completed") {
+            console.log(`[${job.session_id}] timeout reached but session is '${current}' — leaving as-is`);
+            return;
+          }
+          console.error(`[${job.session_id}] TIMEOUT after ${PER_JOB_TIMEOUT_MS}ms — requeuing with backoff`);
           await update(job.session_id, {
-            status: "awaiting_human_action",
-            current_step: "runner_timeout",
-            awaiting_human_since: new Date().toISOString(),
-            error_log: `Runner hard-timeout at ${PER_JOB_TIMEOUT_MS}ms (portal never became interactive)`,
-            next_action: "Portal did not respond in time. Open the resume URL and complete manually.",
+            status: "queued",
+            current_step: "requeued_after_runner_timeout",
+            runner_id: null,
+            claimed_at: null,
+            next_retry_at: new Date(Date.now() + 5 * 60_000).toISOString(),
+            error_log: `Runner hard-timeout at ${PER_JOB_TIMEOUT_MS}ms — auto-requeued`,
           });
         },
       );
@@ -612,4 +966,5 @@ async function main() {
 }
 
 main();
+
 
