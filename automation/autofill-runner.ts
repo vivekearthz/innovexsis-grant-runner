@@ -4,8 +4,12 @@
 //   - "url_paste" : opens the portal URL, extracts the DOM, asks the AI mapper
 //                   for a field map, then fills using that map.
 //
-// Never clicks the final submit. WILL click intermediate "Verify OTP" / "Next"
-// buttons after receiving an OTP from the user's phone.
+// SUBMIT POLICY (owner-authorised, 2026-08-20): the runner fills, uploads,
+// advances wizard steps, verifies every required field/credential is populated,
+// then ACTIVATES the final Submit control and confirms the success screen.
+// It only stops for genuine human-only blockers (OTP, captcha, login, fee),
+// which are escalated to 3 email IDs + 2 WhatsApp numbers immediately.
+
 import { chromium, type Page } from "playwright";
 import { mkdir, writeFile, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -220,6 +224,10 @@ async function updateJob(sessionId: string, body: Record<string, unknown>) {
   if (!res.ok) console.error("job update failed", res.status, await res.text());
 }
 
+// How long to wait for an OTP (mailbox auto-read or human paste) before we
+// treat it as a genuine blocker and escalate.
+const OTP_WAIT_MS = Number(process.env.RUNNER_OTP_WAIT_MS ?? 4 * 60 * 1000);
+
 async function update(sessionId: string, body: Record<string, unknown>) {
   const res = await fetch(`${APP}/api/public/runner/update/${sessionId}`, {
     method: "POST",
@@ -347,6 +355,239 @@ async function clickNext(page: Page): Promise<boolean> {
   if (clicked) await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
   return clicked;
 }
+
+// ---------------- SAFE FORM-DRIVE CORE ----------------
+
+export type Blocker =
+  | "otp_required"
+  | "captcha_unsolved"
+  | "login_required"
+  | "fee_payment"
+  | "awaiting_submit"
+  | "incomplete_fields"
+  | "submit_rejected"
+  | "unknown_blocker";
+
+
+/** Detect a paid-fee gate above the auto-pay ceiling (default ₹1000). */
+const FEE_CEILING_INR = Number(process.env.AUTO_PAY_CEILING_INR ?? 1000);
+
+async function detectFeeGate(page: Page): Promise<number | null> {
+  return page.evaluate(() => {
+    const text = document.body.innerText.slice(0, 8000);
+    if (!/pay(ment)?\s*(now|fee)?|application fee|proceed to pay/i.test(text)) return null;
+    const m = text.match(/(?:₹|rs\.?|inr)\s*([\d,]+)/i);
+    return m ? Number(m[1].replace(/,/g, "")) : 0;
+  }).catch(() => null);
+}
+
+/** Any visible captcha image still unanswered on the page. */
+async function detectCaptcha(page: Page): Promise<boolean> {
+  return page.evaluate(() =>
+    Boolean(document.querySelector("img[src*='captcha' i], img[id*='captcha' i], img[alt*='captcha' i], iframe[src*='recaptcha' i], div.g-recaptcha, div[class*='hcaptcha' i]")),
+  ).catch(() => false);
+}
+
+/** Pull a submission/reference/ARN number off a success page. */
+async function extractReference(page: Page): Promise<string | null> {
+  return page.evaluate(() => {
+    const text = document.body.innerText;
+    const patterns = [
+      /(?:reference|acknowledg(?:e)?ment|application|registration|arn|ack)\s*(?:number|no\.?|id|#)?\s*[:#-]\s*([A-Z0-9][A-Z0-9\/-]{5,30})/i,
+      /\b(ARN[A-Z0-9-]{6,})\b/i,
+      /\b([A-Z]{2,5}\d{8,18})\b/,
+    ];
+    for (const rx of patterns) {
+      const m = text.match(rx);
+      if (m?.[1]) return m[1].trim();
+    }
+    return null;
+  }).catch(() => null);
+}
+
+/** Tick every mandatory declaration/consent checkbox before submitting. */
+async function acceptDeclarations(page: Page): Promise<number> {
+  return page.evaluate(() => {
+    const boxes = Array.from(document.querySelectorAll('input[type="checkbox"]')) as HTMLInputElement[];
+    let n = 0;
+    for (const b of boxes) {
+      const hay = `${b.name} ${b.id} ${b.closest("label")?.textContent ?? ""} ${b.parentElement?.textContent?.slice(0, 200) ?? ""}`.toLowerCase();
+      if (b.checked) continue;
+      if (/declar|agree|consent|terms|undertak|certif|true and correct|i hereby/.test(hay)) {
+        b.click();
+        n++;
+      }
+    }
+    return n;
+  }).catch(() => 0);
+}
+
+/** Detect the real final Submit control without activating it. */
+async function hasFinalSubmitControl(page: Page): Promise<boolean> {
+  return page.evaluate(() => {
+    const wanted = /^(submit|submit application|final submit|apply now|confirm(\s+and\s+submit)?|save\s*&?\s*submit|send application)$/i;
+    const loose = /submit|final\s*submit|confirm\s*&?\s*submit/i;
+    const deny = /reset|cancel|back|logout|search|save\s*as\s*draft/i;
+    const btns = Array.from(document.querySelectorAll('button, input[type="submit"], input[type="button"], a[role="button"]')) as HTMLElement[];
+    const label = (b: HTMLElement) => ((b.textContent ?? (b as HTMLInputElement).value ?? "").trim());
+    const visible = btns.filter((b) => {
+      const r = b.getBoundingClientRect();
+      const t = label(b);
+      return t && r.width > 0 && r.height > 0 && !(b as HTMLButtonElement).disabled && !deny.test(t);
+    });
+    const target = visible.find((b) => wanted.test(label(b))) ?? visible.find((b) => loose.test(label(b)));
+    return Boolean(target);
+  }).catch(() => false);
+}
+
+/**
+ * Owner-authorised (2026-08-20): the runner completes the final Submit itself.
+ * Returns the list of still-empty required fields so we never submit a form
+ * the portal would reject.
+ */
+async function missingRequiredFields(page: Page): Promise<string[]> {
+  return page.evaluate(() => {
+    const out: string[] = [];
+    const els = Array.from(document.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>(
+      "input[required], select[required], textarea[required], input[aria-required='true'], select[aria-required='true'], textarea[aria-required='true']",
+    ));
+    for (const el of els) {
+      const r = el.getBoundingClientRect();
+      if (r.width === 0 && r.height === 0) continue;
+      if (el instanceof HTMLInputElement && (el.type === "checkbox" || el.type === "radio")) {
+        const group = el.name
+          ? Array.from(document.getElementsByName(el.name)) as HTMLInputElement[]
+          : [el];
+        if (!group.some((g) => g.checked)) out.push(el.name || el.id || "checkbox");
+        continue;
+      }
+      if (el instanceof HTMLInputElement && el.type === "file") continue;
+      if (!String(el.value ?? "").trim()) out.push(el.name || el.id || el.getAttribute("aria-label") || "field");
+    }
+    return Array.from(new Set(out)).slice(0, 25);
+  }).catch(() => []);
+}
+
+/** Activate the final Submit control and wait for the portal to settle. */
+async function clickFinalSubmit(page: Page): Promise<boolean> {
+  const clicked = await page.evaluate(() => {
+    const wanted = /^(submit|submit application|final submit|apply now|confirm(\s+and\s+submit)?|save\s*&?\s*submit|send application)$/i;
+    const loose = /submit|final\s*submit|confirm\s*&?\s*submit/i;
+    const deny = /reset|cancel|back|logout|search|save\s*as\s*draft/i;
+    const btns = Array.from(document.querySelectorAll('button, input[type="submit"], input[type="button"], a[role="button"]')) as HTMLElement[];
+    const label = (b: HTMLElement) => ((b.textContent ?? (b as HTMLInputElement).value ?? "").trim());
+    const visible = btns.filter((b) => {
+      const r = b.getBoundingClientRect();
+      const t = label(b);
+      return t && r.width > 0 && r.height > 0 && !(b as HTMLButtonElement).disabled && !deny.test(t);
+    });
+    const target = visible.find((b) => wanted.test(label(b))) ?? visible.find((b) => loose.test(label(b)));
+    if (!target) return false;
+    target.click();
+    return true;
+  }).catch(() => false);
+  if (clicked) {
+    await page.waitForLoadState("networkidle", { timeout: 30000 }).catch(() => {});
+    await page.waitForTimeout(2500);
+    // Some portals raise a "Confirm / Yes / OK" modal after Submit.
+    await page.evaluate(() => {
+      const ok = /^(yes|ok|confirm|proceed|submit)$/i;
+      const btns = Array.from(document.querySelectorAll("button, input[type='button'], input[type='submit']")) as HTMLElement[];
+      const modalBtn = btns.find((b) => {
+        const r = b.getBoundingClientRect();
+        return r.width > 0 && r.height > 0 && ok.test(((b.textContent ?? (b as HTMLInputElement).value ?? "").trim()));
+      });
+      modalBtn?.click();
+    }).catch(() => {});
+    await page.waitForLoadState("networkidle", { timeout: 20000 }).catch(() => {});
+  }
+  return clicked;
+}
+
+/**
+ * Drive every step INCLUDING the final Submit, retrying the submit action
+ * with self-heal until the portal shows a success/reference screen.
+ */
+async function driveToSubmission(
+  page: Page,
+  onOtp: () => Promise<string | null>,
+  maxRounds = 14,
+): Promise<{ ok: true; reference: string | null } | { ok: false; blocker: Blocker; detail: string }> {
+  let submitAttempts = 0;
+  const MAX_SUBMIT_ATTEMPTS = Number(process.env.MAX_SUBMIT_ATTEMPTS ?? 4);
+
+  for (let round = 0; round < maxRounds; round++) {
+    if (await detectSuccess(page)) {
+      return { ok: true, reference: await extractReference(page) };
+    }
+
+    // Real blockers first.
+    if (await detectOtpPrompt(page)) {
+      const otp = await onOtp();
+      if (!otp) return { ok: false, blocker: "otp_required", detail: "OTP not received within the wait window" };
+      const otpSel = await page.evaluate(() => {
+        const inputs = Array.from(document.querySelectorAll("input")) as HTMLInputElement[];
+        const el = inputs.find(i => /otp|verification.?code|one.?time/i.test(`${i.name} ${i.id} ${i.placeholder}`));
+        return el ? (el.id ? `#${el.id}` : `input[name="${el.name}"]`) : null;
+      });
+      if (otpSel) await page.fill(otpSel, otp).catch(() => {});
+      await clickNext(page);
+      continue;
+    }
+
+    if (await detectCaptcha(page)) {
+      const solved = await solveCaptcha(page);
+      if (!solved) return { ok: false, blocker: "captcha_unsolved", detail: "Captcha present and AI solve failed" };
+      await fillFirstAvailable(page, [/captcha|verification.?text|security.?code/], solved).catch(() => null);
+    }
+
+    const fee = await detectFeeGate(page);
+    if (fee !== null && fee > FEE_CEILING_INR) {
+      return { ok: false, blocker: "fee_payment", detail: `Portal asks for ₹${fee} (auto-pay ceiling ₹${FEE_CEILING_INR})` };
+    }
+
+    if (await loginRequired(page)) {
+      return { ok: false, blocker: "login_required", detail: "Portal shows a login wall" };
+    }
+
+    await acceptDeclarations(page);
+
+    if (await hasFinalSubmitControl(page)) {
+      const missing = await missingRequiredFields(page);
+      if (missing.length > 0) {
+        return {
+          ok: false,
+          blocker: "incomplete_fields",
+          detail: `Cannot submit — ${missing.length} mandatory field(s) still empty: ${missing.join(", ")}`,
+        };
+      }
+      submitAttempts++;
+      const clicked = await clickFinalSubmit(page);
+      if (await detectSuccess(page)) {
+        return { ok: true, reference: await extractReference(page) };
+      }
+      if (!clicked || submitAttempts >= MAX_SUBMIT_ATTEMPTS) {
+        return {
+          ok: false,
+          blocker: "submit_rejected",
+          detail: `Final Submit activated ${submitAttempts}x but no success/reference screen appeared`,
+        };
+      }
+      // Portal likely raised a validation error — loop re-heals and retries.
+      continue;
+    }
+    const advanced = await clickNext(page);
+    if (!advanced) {
+      return { ok: false, blocker: "unknown_blocker", detail: "No final Submit or reversible Next control found on the page" };
+    }
+  }
+
+  if (await detectSuccess(page)) return { ok: true, reference: await extractReference(page) };
+  return { ok: false, blocker: "submit_rejected", detail: `No success screen after ${maxRounds} rounds` };
+}
+
+
+
 
 async function fillFirstAvailable(page: Page, patterns: RegExp[], value: string): Promise<string | null> {
   if (!value) return null;
@@ -566,67 +807,50 @@ async function processJob(job: ClaimResp) {
       }
     }
 
-    // 4. Click Next (safe — this is not the final Submit)
+    // 4. Advance every wizard step AND complete the final Submit.
     await update(job.session_id, {
-      current_step: "advancing",
+      current_step: "driving_to_submission",
       fields_filled: filled,
       documents_attached: attached,
     });
-    await clickNext(page);
 
-    // 5. OTP loop — if page has an OTP input, ask the user
-    let iterations = 0;
-    while (iterations < 5) {
-      iterations++;
-      const otpPrompt = await detectOtpPrompt(page);
-      if (!otpPrompt) break;
 
-      console.log(`[${job.session_id}] OTP required — waiting for user`);
-      await update(job.session_id, {
-        awaiting_otp: true,
-        otp_prompt: otpPrompt,
-        current_step: "awaiting_otp",
-      });
+    const outcome = await driveToSubmission(page, async () => {
+      const prompt = (await detectOtpPrompt(page)) ?? "Enter the OTP sent to your registered mobile/email";
+      console.log(`[${job.session_id}] OTP required — waiting (auto-read from mailbox)`);
+      await update(job.session_id, { awaiting_otp: true, otp_prompt: prompt, current_step: "awaiting_otp" });
+      const otp = await waitForOtp(job.session_id, OTP_WAIT_MS);
+      await update(job.session_id, { otp_value: null, awaiting_otp: false, current_step: "verifying_otp" });
+      return otp;
+    });
 
-      const otp = await waitForOtp(job.session_id, 5 * 60 * 1000); // 5 min
-      if (!otp) {
-        await update(job.session_id, { status: "failed", error_log: "OTP timeout (5 min)" });
-        return;
-      }
-
-      // Fill OTP into first OTP-ish field, click next
-      const otpSel = await page.evaluate(() => {
-        const inputs = Array.from(document.querySelectorAll("input")) as HTMLInputElement[];
-        const el = inputs.find(i => /otp|verification.?code|one.?time/i.test(`${i.name} ${i.id} ${i.placeholder}`));
-        if (!el) return null;
-        return el.id ? `#${el.id}` : `input[name="${el.name}"]`;
-      });
-      if (otpSel) await page.fill(otpSel, otp);
-      await update(job.session_id, { otp_value: null, current_step: "verifying_otp" });
-      await clickNext(page);
-    }
-
-    // 6. Success detection
-    if (await detectSuccess(page)) {
-      const shot = await page.screenshot({ fullPage: true });
+    const shot = await page.screenshot({ fullPage: true });
+    if (outcome.ok) {
       await update(job.session_id, {
         status: "completed",
         current_step: "completed",
         success_detected_at: new Date().toISOString(),
         screenshot_base64: shot.toString("base64"),
-        next_action: "Application submitted successfully.",
+        next_action: "Application submitted automatically by the runner.",
+        ...(outcome.reference ? { submission_reference: outcome.reference } : {}),
       });
-      console.log(`[${job.session_id}] SUCCESS`);
+      console.log(`[${job.session_id}] SUBMITTED ref=${outcome.reference ?? "n/a"}`);
     } else {
-      // Fell through OTP loop but no success page. Hand off to human.
-      const shot = await page.screenshot({ fullPage: true });
+      // Genuine human blocker — the backend fans this out to 3 emails + 2
+      // WhatsApp numbers with portal + resume deep links.
       await update(job.session_id, {
         status: "awaiting_human_action",
+        current_step: `blocked_${outcome.blocker}`,
+        blocker: outcome.blocker,
+        portal_url: portalUrl ?? undefined,
         screenshot_base64: shot.toString("base64"),
-        next_action: "Autofill reached a step it couldn't complete. Review the browser and finish manually.",
+        next_action: `${outcome.blocker}: ${outcome.detail}. Clear it on the portal — the runner resumes and submits automatically.`,
         ...(resumeUrl ? { resume_url: resumeUrl } : {}),
       });
+      console.log(`[${job.session_id}] BLOCKED ${outcome.blocker} — escalated`);
     }
+
+
   } catch (e) {
     console.error(`[${job.session_id}] error`, e);
     await update(job.session_id, { status: "failed", error_log: String(e) });
@@ -867,45 +1091,40 @@ async function processJobApplication(job: JobClaimResp) {
       } catch (e) { console.warn("upload failed", (e as Error).message); }
     }
 
-    await updateJob(sid, { fields_filled: filled, documents_attached: attached, current_step: "advancing" });
-    await clickNext(page).catch(() => {});
+    await updateJob(sid, { fields_filled: filled, documents_attached: attached, current_step: "submitting" });
 
-    // Application OTP loop (post-form).
-    let iterations = 0;
-    while (iterations < 5) {
-      iterations++;
-      const otpPrompt = await detectOtpPrompt(page);
-      if (!otpPrompt) break;
-      await updateJob(sid, { awaiting_otp: true, otp_prompt: otpPrompt, current_step: "awaiting_form_otp" });
-      const otp = await waitForOtp(sid, 5 * 60 * 1000);
-      if (!otp) { await updateJob(sid, { status: "failed", error_log: "form OTP timeout" }); return; }
-      const otpSel = await page.evaluate(() => {
-        const inputs = Array.from(document.querySelectorAll("input")) as HTMLInputElement[];
-        const el = inputs.find(i => /otp|verification.?code|one.?time/i.test(`${i.name} ${i.id} ${i.placeholder}`));
-        return el ? (el.id ? `#${el.id}` : `input[name="${el.name}"]`) : null;
-      });
-      if (otpSel) await page.fill(otpSel, otp);
+    const outcome = await driveToSubmission(page, async () => {
+      const prompt = (await detectOtpPrompt(page)) ?? "Enter the OTP sent by the portal";
+      await updateJob(sid, { awaiting_otp: true, otp_prompt: prompt, current_step: "awaiting_form_otp" });
+      const otp = await waitForOtp(sid, OTP_WAIT_MS);
       await updateJob(sid, { otp_value: null, awaiting_otp: false, current_step: "verifying_form_otp" });
-      await clickNext(page);
+      return otp;
+    });
+
+    const shot = await page.screenshot({ fullPage: true });
+    if (outcome.ok) {
+      await updateJob(sid, {
+        status: "completed",
+        current_step: "completed",
+        success_detected_at: new Date().toISOString(),
+        screenshot_base64: shot.toString("base64"),
+        next_action: "Job application submitted automatically by the runner.",
+        ...(outcome.reference ? { submission_reference: outcome.reference } : {}),
+      });
+      console.log(`[job:${sid}] SUBMITTED ref=${outcome.reference ?? "n/a"}`);
+    } else {
+      await updateJob(sid, {
+        status: outcome.blocker === "fee_payment" ? "awaiting_fee" : "awaiting_human_action",
+        current_step: `blocked_${outcome.blocker}`,
+        blocker: outcome.blocker,
+        portal_url: applyUrl,
+        screenshot_base64: shot.toString("base64"),
+        next_action: `${outcome.blocker}: ${outcome.detail}. Clear it on ${job.posting.portal ?? "the portal"} — the runner resumes and submits automatically.`,
+        ...(resumeUrl ? { resume_url: resumeUrl } : {}),
+      });
+      console.log(`[job:${sid}] BLOCKED ${outcome.blocker}`);
     }
 
-    // Fee handling: if page mentions payment >0, hand off (auto-pay not
-    // wired yet — RAZORPAY_UPI_TOKEN pipeline is queued for future patch).
-    const needsFee = await page.evaluate(() =>
-      /pay(ment)?|application fee|₹\s*\d+|rs\.?\s*\d+/i.test(document.body.innerText.slice(0, 5000)),
-    ).catch(() => false);
-
-    // Final: never click Submit ourselves. Screenshot + hand off.
-    const shot = await page.screenshot({ fullPage: true });
-    await updateJob(sid, {
-      status: needsFee ? "awaiting_fee" : "awaiting_human_action",
-      screenshot_base64: shot.toString("base64"),
-      next_action: needsFee
-        ? `Form filled. Pay fee ₹${job.posting.fee_inr ?? "?"} and click Submit. Portal: ${job.posting.portal ?? "unknown"}.`
-        : `Form filled with ${Object.keys(filled).length} fields and ${attached.length} docs. Review and click Submit — runner never submits gov job forms per policy.`,
-      ...(resumeUrl ? { resume_url: resumeUrl } : {}),
-    });
-    console.log(`[job:${sid}] handed off (fee=${needsFee})`);
   } catch (e) {
     console.error(`[job:${sid}] error`, e);
     await updateJob(sid, { status: "failed", error_log: String(e) });
@@ -914,12 +1133,10 @@ async function processJobApplication(job: JobClaimResp) {
   }
 }
 
-async function main() {
-  await resolveBase();
-  console.log(`GovSchemeOS runner ${RUNNER_ID} started (headless=${HEADLESS}), polling ${APP}`);
-  try {
-    const job = await claim();
-    if (!job) { console.log("no job"); return; }
+async function runOneJob(): Promise<boolean> {
+  const job = await claim();
+  if (!job) { console.log("no job"); return false; }
+
     if (job.type === "freelancer_gig") {
       await withTimeout(
         processFreelancerGig(job),
@@ -960,11 +1177,38 @@ async function main() {
         },
       );
     }
-  } catch (e) {
-    console.error("main error", e);
+  return true;
+}
+
+// Continuous worker: keep claiming and finishing sessions until the run
+// deadline. A worker never stops mid-session — the deadline is only checked
+// between jobs, and PER_JOB_TIMEOUT_MS still guards a hung portal.
+const RUN_BUDGET_MS = Number(process.env.RUNNER_RUN_BUDGET_MS ?? 50 * 60 * 1000);
+const IDLE_SLEEP_MS = 15_000;
+
+async function main() {
+  await resolveBase();
+  console.log(`GovSchemeOS runner ${RUNNER_ID} started (headless=${HEADLESS}), polling ${APP}, budget ${RUN_BUDGET_MS}ms`);
+  const deadline = Date.now() + RUN_BUDGET_MS;
+  let done = 0;
+  let idleRounds = 0;
+
+  while (Date.now() + PER_JOB_TIMEOUT_MS < deadline) {
+    try {
+      const worked = await runOneJob();
+      if (worked) { done++; idleRounds = 0; continue; }
+      idleRounds++;
+      if (idleRounds >= 4) break; // queue drained
+      await new Promise((r) => setTimeout(r, IDLE_SLEEP_MS));
+    } catch (e) {
+      console.error("worker loop error", e);
+      await new Promise((r) => setTimeout(r, 5_000));
+    }
   }
+  console.log(`runner ${RUNNER_ID} finished — ${done} sessions processed`);
 }
 
 main();
+
 
 
