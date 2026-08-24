@@ -31,7 +31,9 @@ let APP = BASE_CANDIDATES[0] ?? "";
 const SECRET = process.env.RUNNER_SHARED_SECRET!;
 const RUNNER_ID = process.env.RUNNER_ID ?? `runner-${randomUUID().slice(0, 8)}`;
 const RESUME_TPL = process.env.RESUME_URL_TEMPLATE ?? "";
-const HEADLESS = process.env.RUNNER_HEADLESS === "1";
+// CI/servers have no display. Default to headless and require an explicit
+// RUNNER_HEADLESS=0 only for an operator's local, visible debugging session.
+const HEADLESS = process.env.RUNNER_HEADLESS !== "0";
 
 if (!APP || !SECRET) {
   console.error("APP_BASE_URL and RUNNER_SHARED_SECRET must be set");
@@ -723,11 +725,12 @@ async function processJob(job: ClaimResp) {
   const resumeUrl = RESUME_TPL ? RESUME_TPL.replace("{session_id}", job.session_id) : undefined;
   await update(job.session_id, { status: "filling", ...(resumeUrl ? { resume_url: resumeUrl } : {}) });
 
-  const browser = await chromium.launch({
-    headless: HEADLESS,
-    args: HEADLESS ? [] : ["--remote-debugging-port=9222", "--no-sandbox"],
-  });
+  let browser: Awaited<ReturnType<typeof chromium.launch>> | null = null;
   try {
+    browser = await chromium.launch({
+      headless: HEADLESS,
+      args: HEADLESS ? ["--no-sandbox"] : ["--remote-debugging-port=9222", "--no-sandbox"],
+    });
     const context = await browser.newContext({ acceptDownloads: true });
     const page = await context.newPage();
 
@@ -855,7 +858,7 @@ async function processJob(job: ClaimResp) {
     console.error(`[${job.session_id}] error`, e);
     await update(job.session_id, { status: "failed", error_log: String(e) });
   } finally {
-    await browser.close().catch(() => {});
+    await browser?.close().catch(() => {});
   }
 }
 
@@ -887,11 +890,9 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, onTimeout: () => 
   ]);
 }
 
-// ONE JOB PER RUN, then exit. Prevents workflow-timeout from killing a
-// job mid-fill and matches the user's "one at a time" processing directive.
-// The GitHub Actions cron re-invokes every 5 min, so throughput is unchanged.
-// 7 min budget leaves 60s slack under the 8 min workflow cap and gives the
-// 5-min OTP wait room to complete after navigation/mapping/fill.
+// Hard ceiling for one portal attempt. The outer workflow budget can be equal
+// to this value, so the worker derives a smaller per-attempt timeout from the
+// remaining budget instead of refusing to start any work.
 const PER_JOB_TIMEOUT_MS = 7 * 60 * 1000;
 
 // Fetch current session so we don't clobber a legitimate awaiting_otp /
@@ -1133,46 +1134,46 @@ async function processJobApplication(job: JobClaimResp) {
   }
 }
 
-async function runOneJob(): Promise<boolean> {
+async function runOneJob(timeoutMs = PER_JOB_TIMEOUT_MS): Promise<boolean> {
   const job = await claim();
   if (!job) { console.log("no job"); return false; }
 
     if (job.type === "freelancer_gig") {
       await withTimeout(
         processFreelancerGig(job),
-        PER_JOB_TIMEOUT_MS,
+        timeoutMs,
         async () => { await updateGig(job.id, { status: "awaiting_login", error_log: "runner timeout — handoff" }); },
       );
     } else if (job.type === "job_application") {
       await withTimeout(
         processJobApplication(job),
-        PER_JOB_TIMEOUT_MS,
+        timeoutMs,
         async () => {
           console.error(`[job:${job.session_id}] TIMEOUT — requeuing`);
           await updateJob(job.session_id, {
             status: "failed",
-            error_log: `Runner hard-timeout at ${PER_JOB_TIMEOUT_MS}ms — auto-requeued`,
+            error_log: `Runner hard-timeout at ${timeoutMs}ms — auto-requeued`,
           });
         },
       );
     } else {
       await withTimeout(
         processJob(job),
-        PER_JOB_TIMEOUT_MS,
+        timeoutMs,
         async () => {
           const current = await fetchSessionStatus(job.session_id);
           if (current === "awaiting_otp" || current === "awaiting_human_action" || current === "completed") {
             console.log(`[${job.session_id}] timeout reached but session is '${current}' — leaving as-is`);
             return;
           }
-          console.error(`[${job.session_id}] TIMEOUT after ${PER_JOB_TIMEOUT_MS}ms — requeuing with backoff`);
+          console.error(`[${job.session_id}] TIMEOUT after ${timeoutMs}ms — requeuing with backoff`);
           await update(job.session_id, {
             status: "queued",
             current_step: "requeued_after_runner_timeout",
             runner_id: null,
             claimed_at: null,
             next_retry_at: new Date(Date.now() + 5 * 60_000).toISOString(),
-            error_log: `Runner hard-timeout at ${PER_JOB_TIMEOUT_MS}ms — auto-requeued`,
+            error_log: `Runner hard-timeout at ${timeoutMs}ms — auto-requeued`,
           });
         },
       );
@@ -1193,9 +1194,13 @@ async function main() {
   let done = 0;
   let idleRounds = 0;
 
-  while (Date.now() + PER_JOB_TIMEOUT_MS < deadline) {
+  while (Date.now() < deadline) {
     try {
-      const worked = await runOneJob();
+      const remainingMs = deadline - Date.now();
+      // Keep enough time to persist a final requeue/update before the workflow
+      // process is terminated by its external timeout.
+      if (remainingMs < 30_000) break;
+      const worked = await runOneJob(Math.min(PER_JOB_TIMEOUT_MS, remainingMs - 10_000));
       if (worked) { done++; idleRounds = 0; continue; }
       idleRounds++;
       if (idleRounds >= 4) break; // queue drained
