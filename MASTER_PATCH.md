@@ -1,60 +1,59 @@
-# MASTER PATCH v59 — Repo Name Policy + IMSP JSON Channel
+# MASTER PATCH v70 — Version Convergence + Shared Email/WhatsApp Capacity
 
-Master: MARTECH (marcomm) · canonical registry repo: `vivekearthz/martech-fleet-registry`
-Master host: https://martech.innovexsis.com
-Audience: the master portal, every sub-portal and every slave portal owned by
-vivekearthz (vivekearthz@gmail.com). Master wins on every conflict. Supersedes
-v58 and every earlier patch (all earlier rules still apply).
+Mandatory for the master portal, every sub-portal and every slave portal owned by
+vivekearthz (vivekearthz@gmail.com). Master wins on every conflict. This bundle
+supersedes v59 and folds in everything authored between v60 and v70.
 
-## 0. Single canonical master pointer (new in this rollout)
+## 1. ONE version constant (root cause of the "stuck at v59" drift)
 
-1. `.guardian/identity.json` MUST carry `masterRepo: "vivekearthz/martech-fleet-registry"` and
-   `masterHost: "https://martech.innovexsis.com"`. Any other master repository pointer is STALE and
-   is overwritten automatically.
-2. `patchVersion` MUST equal `v59`. Lower values are force-upgraded
-   by the 24-hourly fleet repoint guard with retry + backoff.
-3. The public `/api/public/portal/version` handshake MUST report the same
-   `patchVersion` as `.guardian/identity.json` — drift there is a defect.
+1. No portal may hard-code a patch/policy version string anywhere. The single
+   source of truth is `src/lib/fleet-version.ts`
+   (`FLEET_PATCH_VERSION`, `FLEET_VERSION_NUMBER`).
+2. `/api/public/portal/version` MUST report that constant, never a literal.
+3. Version comparison is NUMERIC. A portal already ahead of the master is never
+   downgraded; only portals strictly behind are re-patched.
+4. The daily orchestrator re-dispatches the current bundle to every portal whose
+   reported version is behind, with retry + backoff, and re-verifies by loopback
+   against the live deployment (not just the GitHub commit).
 
-## 1. GitHub repository naming policy (zero human intervention)
+## 2. Inherited mandates v60 - v69 (unchanged, restated for slaves)
 
-1. A repository name MUST equal the Lovable project name, slugified
-   (lowercase, non-alphanumeric -> "-", max 90 chars). Random Lovable shells
-   such as `my-secret-automagic-0ad5a80b` are NON-COMPLIANT.
-2. Non-compliant repos are RENAMED in place via `PATCH /repos/{owner}/{repo}`.
-   Never create a duplicate repo, never ask a human to rename anything.
-3. If the canonical name is occupied by a different repository, the incumbent is
-   RETIRED FIRST by renaming it to `old-DDMMYY-<name>` (UTC date).
-4. Orphan random-named repos that no active portal claims are retired the same way.
-5. `portal_registry.github_repo` is repaired after every rename; legacy links are
-   archived to `audit_logs` / `audit_events` and the admin ledger shows CURRENT repos only.
-6. Enforcement runs every 24 hours plus inside the daily fleet orchestrator, then
-   triggers a fleet republish.
+- v60/v61 Shared fleet model registry + weekly free-LLM catalogue refresh.
+- v62 Permissive-license service inheritance (interview copilot family).
+- v63 Fleet service cross-reference: internal-first reuse is enforced in the UI.
+- v64 Autonomous YouTube Shorts automation agent.
+- v65 Master workspace / repo / host identity re-announcement.
+- v66 Commerce + customer-journey parity (pricing, checkout, post-payment
+  hand-off, logout) on every portal.
+- v67 Continuous parity + 3-strike escalation with weekly deep sweep.
+- v68 Total Lovable independence (AI **and** Cloud lanes).
+- v69 Shared fleet email authority: master-owned provider keys only.
 
-## 2. IMSP — Inter-Master Slave Protocol (JSON)
+## 3. Email capacity is POOLED, never single-provider
 
-Master serves IMSP JSON on:
+1. Slaves hold NO email provider keys. They relay through the master.
+2. Daily email capacity reported anywhere (dashboards, digests, pre-flight
+   reports) MUST be the POOLED free allowance across every configured provider
+   — Brevo, SendPulse, Mailjet, MailerSend, SendGrid, Elastic Email, SMTP2GO —
+   not the first provider's 300/day.
+3. Rotation stays quota-aware: providers at their daily allowance are skipped,
+   the rest are ordered by load ratio.
 
-- `POST /api/portal-sync`
-- `POST /api/public/portal-sync`
-- `POST /api/imsp/{action}`
-- `POST /api/public/imsp/{action}`
+## 4. WhatsApp reinstatement ramp target = 750/day
 
-Actions: `sync` (default), `instructions`, `patch`, `report`, `ack`,
-`heartbeat`, `capabilities`, `ping` (unauthenticated health probe).
+1. The post-reinstatement ramp ends at the configured target
+   (`WA_MARKETING_DAILY_TARGET`, default **750**) instead of stalling at an
+   intermediate ladder rung.
+2. Once the ramp days exceed the ladder, the target cap applies permanently
+   while quality stays green.
+3. Hourly pacing must be able to deliver the target inside the send window;
+   the hourly cap default rises with the target.
+4. OTP / auth / service replies are never throttled by these caps.
 
-Auth: `X-Sync-Signature: hmac_sha256(MASTER_SYNC_SECRET, rawBody)`.
-Body: `{ "portal_key": "<slave key>", "action": "sync", "patch_version": "v59" }`.
-Every authenticated call updates `last_event_at` + `sync_status`, so a sync is
-also a heartbeat. Slaves MUST treat any HTML response as a transport failure and
-retry against the next alias with exponential backoff.
+## 5. Self-healing
 
-## 3. Slave requirements
+- Version drift, capacity drift and email-key drift are all repaired by the
+  daily 02:30 IST orchestrator with retry + backoff and owner escalation after
+  3 consecutive failures. No human step is ever required.
 
-- Keep the born-wired `/api/public/portal/sync-now` receiver.
-- Report code inventory and command acks to the master IMSP `report` / `ack`
-  actions; never assume pull-only sync.
-- Do not rename your own GitHub repo; the master owns naming.
-- Do not depend on Lovable credits: the free-first AI ladder of v57 stays in force.
-
-<!-- applied-by: MARTECH master | version: v59 | channel: fleet-repoint-guard -->
+<!-- applied-by: MARTECH master | version: v70 | reason: slave-patch-selfheal:fleet | at: 2026-08-25T10:18:49.848Z -->
