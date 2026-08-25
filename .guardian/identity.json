@@ -4,9 +4,6 @@
   "portalKey": "innovexsisgrantrunner",
   "role": "slave",
   "master": "MARTECH",
-  "masterRepo": "vivekearthz/martech-fleet-registry",
-  "masterHost": "https://martech.innovexsis.com",
-  "patchVersion": "v59",
-  "agentVersion": 6,
+  "patchVersion": "v70",
   "managedBy": "project-guardian"
 }
