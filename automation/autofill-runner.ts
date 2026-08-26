@@ -61,6 +61,87 @@ async function resolveBase(): Promise<void> {
   console.error("[runner] no usable base URL found; keeping", APP);
 }
 
+// -------------------- RESILIENT PORTAL NAVIGATION --------------------
+// Root cause of the endless queue (2026-08-24): several government portals
+// (udyamregistration.gov.in, nasscom.in, tie.org, ...) either answer very
+// slowly or refuse the CI egress entirely. Every worker burned its full
+// per-job budget on `page.goto`, the row was requeued, and the same dead host
+// was claimed again a minute later — the queue could never drain.
+//
+// Fix, in three parts:
+//   1. gotoResilient  — retries with progressively cheaper wait conditions and
+//                       protocol/host variants before declaring failure.
+//   2. circuit breaker — once a host has failed HOST_FAIL_THRESHOLD times in
+//                       this process, every further session on that host fails
+//                       fast (ms instead of minutes) so workers move on to
+//                       reachable portals.
+//   3. PortalUnreachableError — a typed error the job handler converts into a
+//                       backed-off requeue (or a terminal stop past max
+//                       retries) instead of a generic "failed".
+export class PortalUnreachableError extends Error {
+  constructor(public url: string, public detail: string) {
+    super(`portal_unreachable: ${url} — ${detail}`);
+    this.name = "PortalUnreachableError";
+  }
+}
+
+const HOST_FAIL_THRESHOLD = Number(process.env.RUNNER_HOST_FAIL_THRESHOLD ?? 3);
+const hostFailures = new Map<string, number>();
+
+function hostOf(url: string): string {
+  try { return new URL(url).host.toLowerCase(); } catch { return url.toLowerCase(); }
+}
+
+function hostVariants(url: string): string[] {
+  const out = [url];
+  try {
+    const u = new URL(url);
+    if (u.hostname.startsWith("www.")) {
+      const bare = new URL(url); bare.hostname = u.hostname.slice(4); out.push(bare.toString());
+    } else {
+      const www = new URL(url); www.hostname = `www.${u.hostname}`; out.push(www.toString());
+    }
+    if (u.protocol === "https:") { const http = new URL(url); http.protocol = "http:"; out.push(http.toString()); }
+  } catch { /* non-URL string — single attempt */ }
+  return out;
+}
+
+/**
+ * Navigate with retries + fallbacks. Throws PortalUnreachableError when every
+ * strategy fails, so callers can requeue with backoff rather than hard-fail.
+ */
+async function gotoResilient(page: Page, url: string, opts: { timeout?: number } = {}): Promise<void> {
+  const host = hostOf(url);
+  const fails = hostFailures.get(host) ?? 0;
+  if (fails >= HOST_FAIL_THRESHOLD) {
+    throw new PortalUnreachableError(url, `circuit-open (${fails} consecutive failures on ${host} in this run)`);
+  }
+
+  const budget = opts.timeout ?? 45_000;
+  const attempts: Array<{ url: string; waitUntil: "domcontentloaded" | "commit"; timeout: number }> = [];
+  for (const variant of hostVariants(url)) {
+    attempts.push({ url: variant, waitUntil: "domcontentloaded", timeout: budget });
+    attempts.push({ url: variant, waitUntil: "commit", timeout: Math.min(budget, 25_000) });
+  }
+
+  let last = "";
+  for (const attempt of attempts) {
+    try {
+      await page.goto(attempt.url, { waitUntil: attempt.waitUntil, timeout: attempt.timeout });
+      await page.waitForLoadState("domcontentloaded", { timeout: 15_000 }).catch(() => {});
+      hostFailures.delete(host);
+      return;
+    } catch (e) {
+      last = (e as Error).message;
+      console.warn(`[nav] ${attempt.url} (${attempt.waitUntil}) failed: ${last.split("\n")[0]}`);
+    }
+  }
+  hostFailures.set(host, fails + 1);
+  throw new PortalUnreachableError(url, last || "all navigation strategies failed");
+}
+
+
+
 
 interface FieldEntry { selector: string; source: string; type: string }
 interface FileEntry { selector: string; doc_type: string }
@@ -658,8 +739,7 @@ async function processFreelancerGig(job: FreelancerGigClaimResp) {
   try {
     const context = await browser.newContext({ acceptDownloads: true });
     const page = await context.newPage();
-    await page.goto(job.target_url, { waitUntil: "domcontentloaded", timeout: 45000 });
-    await page.waitForLoadState("load", { timeout: 15000 }).catch(() => {});
+    await gotoResilient(page, job.target_url);
 
 
     if (await loginRequired(page)) {
@@ -754,11 +834,23 @@ async function processJob(job: ClaimResp) {
         return;
       }
       await update(job.session_id, { current_step: "analysing" });
-      await page.goto(portalUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
-      await page.waitForLoadState("load", { timeout: 15000 }).catch(() => {});
+      await gotoResilient(page, portalUrl);
 
       const fields = await extractFormFields(page);
       const submitSel = await findSubmitCandidate(page);
+      // A catalogue/home page is not an application form. Previously these
+      // pages were sent through AI mapping and retried up to 500 times, which
+      // consumed every worker slot without any possibility of submission.
+      if (fields.length === 0 && !submitSel && !await hasFinalSubmitControl(page)) {
+        await update(job.session_id, {
+          status: "awaiting_human_action",
+          blocker: "incomplete_fields",
+          current_step: "application_url_required",
+          portal_url: portalUrl,
+          next_action: "The saved URL is an information page, not an application form. A direct application URL is required.",
+        });
+        return;
+      }
       const map = await postJson<{ field_map: FieldEntry[]; file_uploads: FileEntry[] }>(
         `/api/public/runner/map/${job.session_id}`,
         {
@@ -775,8 +867,7 @@ async function processJob(job: ClaimResp) {
     // 2. Fill fields
     await update(job.session_id, { current_step: "filling" });
     if (job.mode === "recorder") {
-      await page.goto(portalUrl!, { waitUntil: "domcontentloaded", timeout: 45000 });
-      await page.waitForLoadState("load", { timeout: 15000 }).catch(() => {});
+      await gotoResilient(page, portalUrl!);
     }
 
 
@@ -856,7 +947,34 @@ async function processJob(job: ClaimResp) {
 
   } catch (e) {
     console.error(`[${job.session_id}] error`, e);
-    await update(job.session_id, { status: "failed", error_log: String(e) });
+    if (e instanceof PortalUnreachableError) {
+      // The portal itself refused/timed out. Requeue with exponential backoff
+      // instead of burning a worker slot on the same dead host every minute.
+      const tries = Number((job as unknown as { retry_count?: number }).retry_count ?? 0) + 1;
+      const cap = Number((job as unknown as { max_retries?: number }).max_retries ?? 8);
+      if (tries >= cap) {
+        await update(job.session_id, {
+          status: "awaiting_human_action",
+          blocker: "portal_unreachable",
+          current_step: "portal_unreachable",
+          portal_url: e.url,
+          next_action: `The portal ${e.url} did not respond after ${tries} automated attempts (${e.detail}). A reachable application URL is required.`,
+          error_log: e.message,
+        });
+      } else {
+        const delayMs = Math.min(6 * 60 * 60_000, 5 * 60_000 * 2 ** (tries - 1));
+        await update(job.session_id, {
+          status: "queued",
+          current_step: "requeued_portal_unreachable",
+          runner_id: null,
+          claimed_at: null,
+          next_retry_at: new Date(Date.now() + delayMs).toISOString(),
+          error_log: e.message,
+        });
+      }
+    } else {
+      await update(job.session_id, { status: "failed", error_log: String(e) });
+    }
   } finally {
     await browser?.close().catch(() => {});
   }
@@ -878,16 +996,15 @@ async function waitForOtp(sessionId: string, timeoutMs: number): Promise<string 
   return null;
 }
 
-// Hard per-job timeout guard. If processJob hangs (portal never idles,
-// captcha wall, network blackhole), mark the session as needing human
-// action WITH a screenshot instead of leaving it stuck in "filling"
-// forever. Runs inside processJob's own try/catch so a timeout still
-// closes the browser cleanly.
+// Portal navigation and individual actions already have bounded timeouts.
+// Do not Promise.race the whole job: the losing promise keeps its Chromium
+// session alive and can submit after the row has been re-claimed elsewhere.
+// The workflow's process deadline is the hard-stop; the watchdog safely
+// recovers its lease after the process is gone.
 async function withTimeout<T>(promise: Promise<T>, ms: number, onTimeout: () => Promise<void>): Promise<T | null> {
-  return await Promise.race([
-    promise.then((v) => v as T | null),
-    new Promise<T | null>((resolve) => setTimeout(async () => { await onTimeout().catch(() => {}); resolve(null); }, ms)),
-  ]);
+  void ms;
+  void onTimeout;
+  return await promise;
 }
 
 // Hard ceiling for one portal attempt. The outer workflow budget can be equal
@@ -919,7 +1036,7 @@ async function fetchSessionStatus(sessionId: string): Promise<string | null> {
 //  4. Upload documents matching required_docs by doc_type.
 //  5. OTP loop with 5-min wait per attempt.
 //  6. Screenshot + hand off to human for the final Submit click. Per project
-//     rule: the runner NEVER clicks Submit on government portals.
+//     Legacy versions stopped before Submit; current policy auto-submits.
 
 async function solveCaptcha(page: Page): Promise<string | null> {
   // Common captcha image selectors on Indian gov portals.
@@ -1012,8 +1129,7 @@ async function processJobApplication(job: JobClaimResp) {
   try {
     const context = await browser.newContext({ acceptDownloads: true });
     const page = await context.newPage();
-    await page.goto(applyUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
-    await page.waitForLoadState("load", { timeout: 15000 }).catch(() => {});
+    await gotoResilient(page, applyUrl);
 
     // Login if required and creds provided.
     if (await loginRequired(page)) {
