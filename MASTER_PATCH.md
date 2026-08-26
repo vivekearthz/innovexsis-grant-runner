@@ -56,4 +56,5 @@ supersedes v59 and folds in everything authored between v60 and v70.
   daily 02:30 IST orchestrator with retry + backoff and owner escalation after
   3 consecutive failures. No human step is ever required.
 
-<!-- applied-by: MARTECH master | version: v70 | reason: slave-patch-selfheal:fleet | at: 2026-08-25T10:18:49.848Z -->
+
+<!-- applied-by: MARTECH master | version: v70 | reason: cron:fleet-identity-drift | at: 2026-08-26T02:29:07.317Z -->
