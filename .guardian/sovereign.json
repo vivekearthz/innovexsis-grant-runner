@@ -1,0 +1,125 @@
+{
+  "schema": 1,
+  "portalKey": "innovexsisgrantrunner",
+  "policyVersion": 71,
+  "master": "MARTECH",
+  "masterApiBase": "https://martech.innovexsis.com/api/public",
+  "rule": "No Lovable dependency may be required. Lovable is last resort only.",
+  "matrix": {
+    "database": {
+      "sovereignPrimary": "self_hosted_supabase_or_neon_postgres",
+      "ladder": [
+        "sovereign_mirror_postgres",
+        "lovable_cloud_postgres"
+      ],
+      "envKeys": [
+        "SOVEREIGN_SUPABASE_URL",
+        "SOVEREIGN_SUPABASE_SERVICE_KEY",
+        "SOVEREIGN_DATABASE_URL"
+      ],
+      "notes": "Free tiers that work: Supabase self-serve project, Neon, Xata, Turso (via HTTP). Guardian state is continuously replicated to the mirror so a paused Lovable database never stops the fleet."
+    },
+    "auth": {
+      "sovereignPrimary": "sovereign_gotrue_on_mirror",
+      "ladder": [
+        "sovereign_gotrue",
+        "lovable_cloud_auth"
+      ],
+      "envKeys": [
+        "SOVEREIGN_SUPABASE_URL",
+        "SOVEREIGN_SUPABASE_ANON_KEY"
+      ],
+      "notes": "GoTrue is portable; the same JWT contract works on any Supabase-compatible host."
+    },
+    "storage": {
+      "sovereignPrimary": "sovereign_s3_compatible",
+      "ladder": [
+        "sovereign_storage",
+        "r2_or_b2",
+        "lovable_cloud_storage"
+      ],
+      "envKeys": [
+        "SOVEREIGN_STORAGE_URL",
+        "SOVEREIGN_STORAGE_KEY"
+      ],
+      "notes": "Any S3-compatible endpoint (Cloudflare R2, Backblaze B2, MinIO)."
+    },
+    "cron": {
+      "sovereignPrimary": "pg_cron_in_database",
+      "ladder": [
+        "pg_cron",
+        "github_actions_schedule",
+        "external_uptime_ping"
+      ],
+      "envKeys": [],
+      "notes": "Schedules live in the database itself and in GitHub Actions; both call the public cron routes, so no Lovable scheduler is required."
+    },
+    "ai": {
+      "sovereignPrimary": "master_ai_gateway",
+      "ladder": [
+        "master_ai_gateway",
+        "nvidia_nim_free",
+        "cursor",
+        "groq",
+        "openrouter",
+        "pollinations_keyless",
+        "lovable_gateway_only_if_enabled"
+      ],
+      "envKeys": [
+        "MASTER_SYNC_SECRET",
+        "NVIDIA_API_KEY_SECRET",
+        "CURSOR_API_KEY",
+        "GROQ_API_KEY"
+      ],
+      "notes": "Keyless floor guarantees AI keeps working with zero credits."
+    },
+    "email": {
+      "sovereignPrimary": "master_email_relay",
+      "ladder": [
+        "master_email_relay",
+        "lovable_emails_last_resort"
+      ],
+      "envKeys": [
+        "MASTER_SYNC_SECRET"
+      ],
+      "notes": "Master owns and rotates the provider keys; slaves hold none."
+    },
+    "publish": {
+      "sovereignPrimary": "deploy_hook_or_github_actions",
+      "ladder": [
+        "master_deploy_hook",
+        "github_actions_deploy",
+        "manual_publish"
+      ],
+      "envKeys": [
+        "REPUBLISH_HOOK_URL",
+        "GITHUB_API_KEY"
+      ],
+      "notes": "When no hook exists, GitHub Actions on the slave repository can rebuild and deploy the static/worker bundle to any host."
+    },
+    "frontend": {
+      "sovereignPrimary": "vite_tanstack_bundle_portable",
+      "ladder": [
+        "cloudflare_workers",
+        "netlify",
+        "vercel",
+        "lovable_hosting"
+      ],
+      "envKeys": [],
+      "notes": "The build output is standard; no Lovable-only runtime API is used at render time."
+    },
+    "connectors": {
+      "sovereignPrimary": "direct_provider_apis_via_master",
+      "ladder": [
+        "master_connector_relay",
+        "direct_api_keys",
+        "lovable_connectors"
+      ],
+      "envKeys": [
+        "MASTER_SYNC_SECRET",
+        "GITHUB_API_KEY"
+      ],
+      "notes": "GitHub access already flows through a portable API key header."
+    }
+  }
+}
