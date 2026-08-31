@@ -86,7 +86,11 @@ export class PortalUnreachableError extends Error {
 }
 
 const HOST_FAIL_THRESHOLD = Number(process.env.RUNNER_HOST_FAIL_THRESHOLD ?? 3);
-const hostFailures = new Map<string, number>();
+// Open circuits are not permanent: after this cooldown the host gets one more
+// probe, so a brief outage cannot drain the rest of that portal's queue.
+const HOST_CIRCUIT_COOLDOWN_MS = Number(process.env.RUNNER_HOST_COOLDOWN_MS ?? 10 * 60_000);
+const hostFailures = new Map<string, { count: number; openedAt: number }>();
+
 
 function hostOf(url: string): string {
   try { return new URL(url).host.toLowerCase(); } catch { return url.toLowerCase(); }
@@ -112,9 +116,14 @@ function hostVariants(url: string): string[] {
  */
 async function gotoResilient(page: Page, url: string, opts: { timeout?: number } = {}): Promise<void> {
   const host = hostOf(url);
-  const fails = hostFailures.get(host) ?? 0;
-  if (fails >= HOST_FAIL_THRESHOLD) {
-    throw new PortalUnreachableError(url, `circuit-open (${fails} consecutive failures on ${host} in this run)`);
+  const entry = hostFailures.get(host);
+  let fails = entry?.count ?? 0;
+  if (entry && fails >= HOST_FAIL_THRESHOLD) {
+    if (Date.now() - entry.openedAt < HOST_CIRCUIT_COOLDOWN_MS) {
+      throw new PortalUnreachableError(url, `circuit-open (${fails} consecutive failures on ${host}; cooling down)`);
+    }
+    // Cooldown elapsed — half-open: allow one probe.
+    fails = HOST_FAIL_THRESHOLD - 1;
   }
 
   const budget = opts.timeout ?? 45_000;
@@ -136,9 +145,10 @@ async function gotoResilient(page: Page, url: string, opts: { timeout?: number }
       console.warn(`[nav] ${attempt.url} (${attempt.waitUntil}) failed: ${last.split("\n")[0]}`);
     }
   }
-  hostFailures.set(host, fails + 1);
+  hostFailures.set(host, { count: fails + 1, openedAt: Date.now() });
   throw new PortalUnreachableError(url, last || "all navigation strategies failed");
 }
+
 
 
 
@@ -260,20 +270,34 @@ async function fillField(page: Page, entry: FieldEntry, value: string) {
   }
 }
 
-async function claim(): Promise<RunnerJob | null> {
+let claimCursor = [...RUNNER_ID].reduce((sum, char) => sum + char.charCodeAt(0), 0) % 3;
+
+async function claimAutofill(): Promise<RunnerJob | null> {
   const res = await fetch(`${APP}/api/public/runner/claim`, {
     method: "POST",
     headers: { "content-type": "application/json", "x-runner-secret": SECRET },
     body: JSON.stringify({ runnerId: RUNNER_ID }),
   });
-  if (res.status === 204) {
-    const job = await claimJobApplication();
-    if (job) return job;
-    return await claimFreelancerGig();
-  }
+  if (res.status === 204) return null;
   if (!res.ok) { console.error("claim failed", res.status, await res.text()); return null; }
   const job = await res.json() as ClaimResp;
   return { type: "autofill", ...job };
+}
+
+async function claim(): Promise<RunnerJob | null> {
+  const claimers: Array<() => Promise<RunnerJob | null>> = [
+    claimAutofill,
+    claimJobApplication,
+    claimFreelancerGig,
+  ];
+  const start = claimCursor;
+  claimCursor = (claimCursor + 1) % claimers.length;
+  for (let offset = 0; offset < claimers.length; offset++) {
+    const claimer = claimers[(start + offset) % claimers.length];
+    const job = await claimer();
+    if (job) return job;
+  }
+  return null;
 }
 
 async function claimJobApplication(): Promise<JobClaimResp | null> {
@@ -794,7 +818,16 @@ async function processFreelancerGig(job: FreelancerGigClaimResp) {
     });
   } catch (e) {
     console.error(`[gig:${job.id}] error`, e);
-    await updateGig(job.id, { status: "failed", error_log: String(e) });
+    if (e instanceof PortalUnreachableError) {
+      await updateGig(job.id, {
+        status: "queued",
+        next_retry_at: new Date(Date.now() + 30 * 60_000).toISOString(),
+        error_log: e.message,
+      });
+    } else {
+      await updateGig(job.id, { status: "failed", error_log: String(e) });
+    }
+
   } finally {
     await browser.close().catch(() => {});
   }
@@ -1244,7 +1277,16 @@ async function processJobApplication(job: JobClaimResp) {
 
   } catch (e) {
     console.error(`[job:${sid}] error`, e);
-    await updateJob(sid, { status: "failed", error_log: String(e) });
+    if (e instanceof PortalUnreachableError) {
+      await updateJob(sid, {
+        status: "queued",
+        next_retry_at: new Date(Date.now() + 30 * 60_000).toISOString(),
+        error_log: e.message,
+      });
+    } else {
+      await updateJob(sid, { status: "failed", error_log: String(e) });
+    }
+
   } finally {
     await browser.close().catch(() => {});
   }
