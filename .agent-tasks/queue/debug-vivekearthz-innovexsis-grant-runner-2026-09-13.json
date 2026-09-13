@@ -1,0 +1,10 @@
+{
+  "task_id": "debug-vivekearthz-innovexsis-grant-runner-2026-09-13",
+  "created_at": "2026-09-13T09:23:09.713Z",
+  "assignee": "cursor",
+  "repo": "vivekearthz/innovexsis-grant-runner",
+  "ref": "main",
+  "kind": "full-debug-and-harden",
+  "prompt": "Full debugging and hardening pass on vivekearthz/innovexsis-grant-runner (branch main).\n\nDo this in order and open one PR with the fixes:\n1. Install dependencies and run the type checker, unit tests and a production build.\n2. Fix every compile, type and test failure. Do not suppress errors with casts or ignores.\n3. Audit for security issues: exposed secrets, missing auth checks on server routes,\n   missing row-level-security policies or GRANTs on public tables, unvalidated input,\n   SSRF/injection risk, dependency CVEs. Fix what you find.\n4. Audit for silent runtime bugs: unhandled promise rejections, missing error boundaries,\n   unbounded loops/fetches, missing retries on network calls.\n5. Remove any hard dependency on a single vendor: configuration must come from env vars,\n   AI/email/messaging calls must have a direct-provider path plus retry and fallback.\n6. Write the outcome to `.agent-tasks/results/debug-vivekearthz-innovexsis-grant-runner-2026-09-13.json` as\n   `{ \"task_id\", \"status\": \"passed\"|\"fixed\"|\"blocked\", \"summary\", \"changed_files\", \"remaining\" }`.\n\nConstraints: no framework swaps, no secrets in the repo, keep changes minimal and reviewable.",
+  "result_path": ".agent-tasks/results/debug-vivekearthz-innovexsis-grant-runner-2026-09-13.json"
+}
