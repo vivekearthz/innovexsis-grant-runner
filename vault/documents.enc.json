@@ -1,8 +1,8 @@
 {
-  "snapshot_at": "2026-09-15T02:05:03.513Z",
+  "snapshot_at": "2026-09-16T02:05:04.408Z",
   "count": 0,
   "manifest_hash": "4f53cda18c2baa0c0354bb5f9a3ecbe5",
   "algorithm": "AES-256-GCM(iv|tag|ct base64)",
   "note": "Encrypted document index only. No file bytes. Decrypt requires PROFILE_FACTS_ENC_KEY.",
-  "ciphertext": "pYG3uzpxWCBODFzYfWytAE5Jyn4wM5inaS3tfQE5"
+  "ciphertext": "byVwsRN2D+yQW7mDGPa/vyOQW9qHHJECjwBrLFQ3"
 }
